@@ -16,7 +16,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_all.ps1
 |---|---|---|
 | `_test_web_lite.py` | 客户端已启动、8080 可用 | 首次设置、登录、本机设置、端口校验、启停、锁定/解锁、CSRF、路径穿越 |
 | `_test_e2e_lite.py` | 上一步创建的管理密码 `admin123` / 解锁密码 `888888` | 时间耗尽直接蓝屏、手机解锁、暂停不锁 |
-| `_test_units_lite.py` | 无 | 快捷键、端口、连点、静音、数据库迁移、登录限流、指令分流 |
+| `_test_units_lite.py` | Windows（仅守护进程段） | 快捷键、端口、连点、静音、数据库迁移、登录限流、指令分流、守护进程停止（真起子进程） |
 | `_test_backdoor.py` | 无 | 连点 9 次不触发、第 10 次触发、超时不累计 |
 | `_test_ui_lite.py` | 图形环境（Windows 桌面或 xvfb） | 进度、连点绑定、首次设置、后门密码框、控制面板/每日额度 |
 | `_test_service_units.py` | 无 | 服务数据目录、备份恢复、JSON 重建、ACL 参数、服务命令、任务管理器策略 |

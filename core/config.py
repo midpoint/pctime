@@ -138,6 +138,8 @@ DB_PATH = DATA_DIR / 'data.db'
 CFG_PATH = DATA_DIR / 'config.json'
 LOG_PATH = DATA_DIR / 'client.log'
 WD_PID = DATA_DIR / 'watchdog.pid'
+# 停止标记：退出时先落这个文件，守护进程看到就自行退出、不再拉起程序
+WD_STOP = DATA_DIR / 'watchdog.stop'
 
 
 def load_cfg() -> dict:

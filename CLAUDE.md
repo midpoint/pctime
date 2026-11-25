@@ -43,7 +43,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_all.ps1
 
 1. `_test_web_lite.py` —— 网页流程、本机设置、端口校验
 2. `_test_e2e_lite.py` —— 时间耗尽锁屏、手机解锁
-3. `_test_units_lite.py` —— 快捷键/端口/连点/静音状态机/数据库迁移（纯逻辑）
+3. `_test_units_lite.py` —— 快捷键/端口/连点/静音状态机/数据库迁移/登录限流/指令分流（纯逻辑），以及守护进程停止（仅 Windows，真起并结束一个子进程）
 4. `_test_backdoor.py` —— 连点后门纯逻辑
 5. `_test_ui_lite.py` —— Tkinter 进度、连点绑定、首次设置、控制面板（需要图形环境）
 6. `_test_service_units.py` —— 服务数据目录、备份恢复、ACL 参数、服务命令、任务管理器策略
@@ -52,7 +52,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_all.ps1
 
 - `_test_web_lite.py` 与 `_test_e2e_lite.py` 共享同一个运行中的客户端和同一份数据库；`_test_e2e_lite.py` 依赖前者的管理密码 `admin123`、解锁密码 `888888`，且都硬编码 `127.0.0.1:8080`，必须按此顺序跑。
 - 单独跑某个测试：先设置上述环境变量并 `python main.py`，再执行对应脚本。
-- `_test_units_lite.py` 会在导入 `core.config` 前把 `LOCALAPPDATA` 指向临时目录；`_test_backdoor.py` 不启动客户端、不显示窗口。
+- `_test_units_lite.py` 会在导入 `core.config` 前把 `LOCALAPPDATA` 与 `PCTL_DATA_DIR` 都指向同一个临时目录（后者优先级更高）；`_test_backdoor.py` 不启动客户端、不显示窗口。
 - 测试结束时 `run_all.ps1` 会停止客户端、保存日志到 `tests/last_run.log`，并删除测试数据/注册表，避免测试密码 `admin123` 残留。
 
 手动重置到首次使用状态：删除 `%LOCALAPPDATA%\PCTimeControlLite` 和注册表 `HKCU\Software\PCTimeControlLite`。
@@ -139,8 +139,10 @@ powershell -ExecutionPolicy Bypass -File tests\run_all.ps1
 ### 单实例与 watchdog
 
 - `ui.win32.acquire_single_instance()` 用 `CreateMutexW('Local\\PCTimeLite_SingleInstance')`；句柄必须活到进程结束。
-- `main.py --watchdog <pid>` 是 detached 子进程，每 3 秒检查目标 PID，退出后重启；连续 3 次新进程活不过 4 秒则熔断退出。自身 PID 写入 `watchdog.pid`。
-- 家长退出必须先 `kill_watchdog()` 再 `root.quit()/destroy()`，否则 watchdog 会在 3 秒内重新拉起。
+- `main.py --watchdog <pid>` 是 detached 子进程，每 3 秒检查目标 PID，退出后重启；连续 3 次新进程活不过 4 秒则熔断退出（每次失败后间隔 10 秒重试，不会一次失败就永久停摆）。自身 PID 写入 `watchdog.pid`。
+- watchdog 与主进程各自拥有独立的 `_MEI` 解压目录：拉起子进程时设 `PYINSTALLER_RESET_ENVIRONMENT=1`。共用目录时，主进程退出删不掉解压目录（弹 “Failed to remove temporary directory”），被拉起的实例还会因运行库已随目录删除而弹 “Failed to start embedded python interpreter!”。
+- 家长退出必须先 `kill_watchdog()` 再 `root.quit()/destroy()`。停法两道：先落停止标记 `watchdog.stop`（watchdog 看到就自行退出、绝不再拉起），再用 `TerminateProcess` 直接结束并等它退出。不要用 `taskkill` 子进程——在 `--noconsole` 构建里调用它会卡满超时而目标进程仍存活。
+- 终止没成功时保留 `watchdog.pid`（留着下次启动才能找到它）；只有确认进程已死、或确认该 pid 不是本程序时才删除。`_is_our_exe()` 用来防 pid 复用误杀，认不出时只记日志不动手。
 - 便携模式没有本地密码就无法打开面板（`show_panel` 校验管理密码，面板 3 分钟自动隐藏）；管理密码连续失败 5 次暂停 1 分钟。
 - PyInstaller onefile 每次启动解压到 `%TEMP%\_MEI*`；`cleanup_stale_meipass()` 清理超过 24 小时的残留，watchdog 重启前额外等 1.2 秒。
 

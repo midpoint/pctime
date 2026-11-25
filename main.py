@@ -162,6 +162,7 @@ class App:
     def _exit_unconfigured(self) -> None:
         config.log('[setup] 家长退出首次设置')
         self.shutdown(configured=False)
+        kill_watchdog()          # 上一轮遗留的守护进程也不能留着，否则它会把程序拉起来
         try:
             self.root.destroy()
         except Exception:
@@ -768,24 +769,94 @@ def watchdog_running() -> bool:
         return False
 
 
+def _is_our_exe(pid: int) -> bool:
+    """pid 对应的进程是不是同一个 exe（防止 pid 复用后误杀无关进程）。"""
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_uint32)]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        h = k32.OpenProcess(0x1000, 0, int(pid))       # QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.c_uint32(1024)
+            if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return False
+        finally:
+            k32.CloseHandle(h)
+        # 源码运行时守护进程用的是 pythonw.exe，与本进程的 python.exe 同目录，一并认下
+        image = Path(buf.value).resolve()
+        here = Path(sys.executable).resolve()
+        return image in {here, here.with_name('python.exe').resolve(),
+                         here.with_name('pythonw.exe').resolve()}
+    except Exception:
+        return False
+
+
+def terminate_pid(pid: int, wait_ms: int = 3000) -> bool:
+    """直接结束进程并等它退出，返回是否确认已死。
+
+    不用 taskkill：它是外部控制台程序，在 --noconsole 的本程序里调用曾两次卡满
+    5 秒超时、目标进程却仍存活——守护进程没停掉，退出后它就把程序重新拉起来。
+    """
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        h = k32.OpenProcess(0x0001 | 0x00100000, 0, int(pid))   # TERMINATE | SYNCHRONIZE
+        if not h:
+            return not pid_alive(pid)
+        try:
+            k32.TerminateProcess(h, 1)
+            k32.WaitForSingleObject(h, int(wait_ms))
+        finally:
+            k32.CloseHandle(h)
+    except Exception as e:
+        config.log(f'[watchdog] 终止 pid={pid} 出错: {e}')
+    return not pid_alive(pid)
+
+
 def kill_watchdog() -> None:
-    """家长主动退出时，必须先把守护进程杀掉，否则它会把程序又拉起来。"""
+    """停掉守护进程。家长主动退出时必须先做，否则它会把程序又拉起来。
+
+    终止不一定成功（权限、杀软、进程卡住），所以先落一个停止标记：
+    守护进程看到标记就自行退出，绝不会再把程序拉起来。
+    """
     try:
         pid = int(config.WD_PID.read_text(encoding='utf-8').strip())
     except Exception:
-        return
-    if not pid or pid == os.getpid():
-        return
-    try:
-        subprocess.run(['taskkill', '/PID', str(pid), '/F'],
-                       capture_output=True, timeout=5)
-        config.log(f'[watchdog] 已停止守护进程 pid={pid}')
-    except Exception as e:
-        config.log(f'[watchdog] 停止失败: {e}')
-    try:
-        config.WD_PID.unlink()
-    except Exception:
-        pass
+        pid = 0
+    alive = bool(pid) and pid != os.getpid() and pid_alive(pid)
+    ours = alive and _is_our_exe(pid)
+    if alive:
+        # 不管认不认得这个 pid，先落停止标记：它看到就不会再把程序拉起来
+        try:
+            config.WD_STOP.write_text(str(int(time.time())), encoding='utf-8')
+        except Exception:
+            pass
+    if ours:
+        if terminate_pid(pid, 3000):
+            config.log(f'[watchdog] 已停止守护进程 pid={pid}')
+        else:
+            config.log(f'[watchdog] 未能终止守护进程 pid={pid}，已留停止标记')
+    elif alive:
+        config.log(f'[watchdog] pid={pid} 不是本程序进程，已忽略并清理 pid 文件')
+    # 只有确认是自己、且还活着才保留 pid 文件；其余都是陈旧记录，删掉才能重新拉起
+    if not (ours and pid_alive(pid)):
+        try:
+            config.WD_PID.unlink()
+        except Exception:
+            pass
 
 
 def cleanup_stale_meipass() -> None:
@@ -814,9 +885,25 @@ def cleanup_stale_meipass() -> None:
 
 
 def spawn_watchdog() -> None:
+    kill_watchdog()          # 先了结上一轮遗留的守护进程，免得它盯着旧 pid 乱拉起
     if watchdog_running():
+        # 终止没成功：停止标记会让它自行退出。等它退干净再起，不能就这么裸奔
+        for _ in range(20):
+            time.sleep(0.25)
+            if not watchdog_running():
+                break
+    if watchdog_running():
+        config.log('[watchdog] 旧守护进程未退出，本会话没有守护（已留停止标记）')
         return
+    try:
+        config.WD_STOP.unlink()      # 清掉上一轮留下的停止标记
+    except Exception:
+        pass
     base = config.app_dir()
+    # 让守护进程有自己的 _MEI 解压目录：与主进程共用时，主进程退出清理解压目录会被它锁住，
+    # 于是弹出 “Failed to remove temporary directory”。
+    env = dict(os.environ)
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
     if getattr(sys, 'frozen', False):
         args = [sys.executable, '--watchdog', str(os.getpid())]
     else:
@@ -827,19 +914,27 @@ def spawn_watchdog() -> None:
     try:
         subprocess.Popen(args, cwd=str(base), creationflags=DETACHED,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
+                         stderr=subprocess.DEVNULL, env=env)
         config.log('[watchdog] 已启动')
     except Exception as e:
         config.log(f'[watchdog] 启动失败: {e}')
 
 
-def run_watchdog(pid: int) -> None:
+def run_watchdog(pid: int, interval: float = 3.0, max_rounds: int | None = None) -> None:
+    """守护主进程：每 interval 秒看一眼目标，退出就重新拉起。
+
+    interval / max_rounds 只是测试用的覆盖点，默认值与线上行为一致。
+    """
     base = config.app_dir()
     try:
         config.WD_PID.write_text(str(os.getpid()), encoding='utf-8')
     except Exception:
         pass
     config.log(f'[watchdog] 守护 target={pid}')
+    # 拉起的新实例要自带 _MEI 解压目录：继承本进程的目录时，主进程退出会把这目录删掉，
+    # 新实例随即因加载不到 python 运行库弹 “Failed to start embedded python interpreter!”。
+    env = dict(os.environ)
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
     if getattr(sys, 'frozen', False):
         args = [sys.executable]
     else:
@@ -849,34 +944,46 @@ def run_watchdog(pid: int) -> None:
 
     target = pid
     fails = 0
+    rounds = 0
     while True:
-        time.sleep(3)
-        if target and not pid_alive(target):
-            # 给旧进程留一点时间彻底释放文件句柄，否则新实例解压可能撞车
-            time.sleep(1.2)
-            config.log('[watchdog] 主进程已退出，重新拉起')
-            try:
-                p = subprocess.Popen(args, cwd=str(base), creationflags=DETACHED,
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
-                target = p.pid
-            except Exception as e:
-                config.log(f'[watchdog] 拉起失败: {e}')
-                target = 0
-                continue
+        time.sleep(interval)
+        rounds += 1
+        if config.WD_STOP.exists():
+            config.log('[watchdog] 收到停止标记，退出')
+            break
+        if max_rounds is not None and rounds >= max_rounds:
+            config.log('[watchdog] 到达运行轮次上限，退出')
+            break
+        if target and pid_alive(target):
+            continue
+        # 熔断：连续 3 次拉起后都活不过 4 秒，说明有别的实例占着或环境异常，
+        # 继续拉只会变成死循环，直接放弃。
+        if fails >= 3:
+            config.log('[watchdog] 连续拉起失败，守护进程退出')
+            break
+        # 给旧进程留一点时间彻底释放文件句柄，否则新实例解压可能撞车
+        time.sleep(1.2)
+        config.log('[watchdog] 主进程已退出，重新拉起')
+        try:
+            p = subprocess.Popen(args, cwd=str(base), creationflags=DETACHED,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, env=env)
+        except Exception as e:
+            config.log(f'[watchdog] 拉起失败: {e}')
+            fails += 1
+            target = 0
+            time.sleep(10)
+            continue
 
-            # 熔断：连续 3 次拉起后都活不过 4 秒，说明有别的实例占着或环境异常，
-            # 继续拉只会变成死循环，直接放弃。
-            time.sleep(4)
-            if not pid_alive(target):
-                fails += 1
-                config.log(f'[watchdog] 新进程未能存活（第 {fails} 次）')
-                if fails >= 3:
-                    config.log('[watchdog] 连续失败，守护进程退出')
-                    break
-                target = 0
-            else:
-                fails = 0
+        target = p.pid
+        time.sleep(4)
+        if pid_alive(target):
+            fails = 0
+        else:
+            fails += 1
+            config.log(f'[watchdog] 新进程未能存活（第 {fails} 次）')
+            target = 0
+            time.sleep(10)
 
 
 # ------------------------------------------------------------------ 入口
@@ -923,12 +1030,6 @@ def _installed_notice() -> int:
 
 
 def main() -> int:
-    # 服务模式可能有多个同名 exe 进程共用一个账号的 _MEI 目录；
-    # 清理残留可能误删仍在运行的服务解压目录，因此只在便携模式清理。
-    if not any(m in sys.argv for m in ('--install', '--uninstall',
-                                       '--service', '--web', '--agent')):
-        cleanup_stale_meipass()
-
     if '--install' in sys.argv:
         from service.install import install
         return install()
@@ -978,6 +1079,10 @@ def main() -> int:
     if not win32.acquire_single_instance():
         config.log('[app] 已有实例在运行')
         return 0
+
+    # 清理残留放到单实例之后：已有一个实例（及其拥有独立 _MEI 的 watchdog）在跑时，
+    # 它解压目录的 mtime 可能早就过了 24 小时，此时扫掉会把活用的文件删一半。
+    cleanup_stale_meipass()
 
     root = tk.Tk()
     root.withdraw()

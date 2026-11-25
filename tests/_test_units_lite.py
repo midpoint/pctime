@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""纯逻辑单元测试：快捷键、端口校验、连点计数、静音状态机、数据库迁移。
+"""纯逻辑单元测试：快捷键、端口校验、连点计数、静音状态机、数据库迁移、
+登录限流、指令分流，以及守护进程停止（仅 Windows，会真起并结束一个子进程）。
 
-不启动客户端、不显示窗口，可跨平台运行。
+不启动客户端、不显示窗口；除守护进程段（仅 Windows）外均可跨平台运行。
 
 作者：野怼怼；https://www.bd7iwd.com
 许可：MIT
@@ -15,7 +16,10 @@ import tempfile
 from pathlib import Path
 
 # 必须在导入 core.config 之前指定数据目录，避免污染真实数据
-os.environ['LOCALAPPDATA'] = tempfile.mkdtemp(prefix='pctl_units_')
+# （PCTL_DATA_DIR 优先级高于 LOCALAPPDATA，两个都要指到临时目录）
+_TMP_DATA = tempfile.mkdtemp(prefix='pctl_units_')
+os.environ['LOCALAPPDATA'] = _TMP_DATA
+os.environ['PCTL_DATA_DIR'] = _TMP_DATA
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -32,6 +36,10 @@ def check(name, cond, extra=''):
     print(('  PASS  ' if cond else '  FAIL  ') + name + (('  -> ' + str(extra)) if extra and not cond else ''))
     if not cond:
         ok = False
+
+
+check('数据目录在临时目录内', str(config.DATA_DIR).startswith(tempfile.gettempdir()),
+      config.DATA_DIR)
 
 
 # ------------------------------------------------------------------ 快捷键
@@ -185,6 +193,36 @@ for _ in range(5):
 check('5 次失败后限流', web_server._login_blocked(ip) is True)
 web_server._login_ok(ip)
 check('成功登录后解除限流', web_server._login_blocked(ip) is False)
+
+if os.name == 'nt':
+    print('=== 守护进程 ===')
+    import subprocess  # noqa: E402
+    import time  # noqa: E402
+
+    import main as app_main  # noqa: E402
+
+    keeper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
+                              creationflags=0x08000000)
+    try:
+        # 停止标记：watchdog 看到就退出，且不再拉起程序
+        config.WD_STOP.write_text('1', encoding='utf-8')
+        started = time.monotonic()
+        app_main.run_watchdog(keeper.pid, interval=0.05, max_rounds=20)
+        elapsed = time.monotonic() - started
+        check('看到停止标记后 watchdog 退出', elapsed < 2, f'{elapsed:.2f}s')
+        check('没有拉起新实例', app_main.pid_alive(keeper.pid))
+
+        # 停止：先落标记，再直接结束进程
+        config.WD_PID.write_text(str(keeper.pid), encoding='utf-8')
+        config.WD_STOP.unlink()
+        app_main.kill_watchdog()
+        check('停止后进程已退出', not app_main.pid_alive(keeper.pid))
+        check('落下停止标记', config.WD_STOP.exists())
+        check('确认死后清掉 pid 文件', not config.WD_PID.exists())
+    finally:
+        if keeper.poll() is None:
+            keeper.kill()
+
 
 print()
 print('=== 全部通过 ===' if ok else '=== 存在失败项 ===')
